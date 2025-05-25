@@ -21,7 +21,7 @@ A Golang-based interactive interface that enables users to:
   - Upload/download files
   - Take screenshots
 
-- **Set up TCP/UDP listeners** bound to specific ports
+- **Set up TCP listeners** bound to specific ports
 
 - **Use scripting** to automate interactions using pre-written RingShell command files
 
