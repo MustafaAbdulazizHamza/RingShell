@@ -14,6 +14,8 @@ var (
 	outFlag  string
 	opS      string
 	arch     string
+	isHTTPS  bool
+	isSecure bool
 )
 
 func init() {
@@ -22,6 +24,8 @@ func init() {
 	flag.StringVar(&outFlag, "out", "", "Output directory (Full path)")
 	flag.StringVar(&opS, "os", "", "The target operating system (lowercase)")
 	flag.StringVar(&arch, "arch", "", "The target architecture")
+	flag.BoolVar(&isHTTPS, "https", false, "Use HTTPS for communication")
+	flag.BoolVar(&isSecure, "secure", false, "Enable TLS certificate verification (requires valid certificates)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage of %s:
@@ -33,7 +37,9 @@ Flags:
 
 		fmt.Fprintln(os.Stderr, `
 Example:
-  ./sauron -ip 192.168.1.10 -port 8080 -os windows -arch amd64 -out <output path>`)
+  ./sauron -ip 192.168.1.10 -port 8080 -os windows -arch amd64 -out <output path>
+  ./sauron -ip 192.168.1.10 -port 443 -os linux -arch amd64 -https -out <output path>
+  ./sauron -ip 192.168.1.10 -port 443 -os linux -arch amd64 -https -secure -out <output path>`)
 	}
 }
 
@@ -56,10 +62,12 @@ func main() {
 	content := fmt.Sprintf(`package main
 
 var (
-	address string = "%s"
-	port    int    = %d
+	address   string = "%s"
+	port      int    = %d
+	useHTTPS  bool   = %t
+	tlsVerify bool   = %t
 )
-`, ipFlag, portFlag)
+`, ipFlag, portFlag, isHTTPS, isSecure)
 
 	if _, err := file.WriteString(content); err != nil {
 		log.Fatalf("Failed to write to file: %v", err)
@@ -70,16 +78,8 @@ var (
 }
 
 func callBuildScript(goos, goarch, outDir string) error {
-	scriptPath := "./build.sh"
-
-	cmd := exec.Command(scriptPath, goos, goarch, outDir)
+	cmd := exec.Command("bash", "build.sh", goos, goarch, outDir)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("Building failed: %w", err)
-	}
-
-	return nil
+	return cmd.Run()
 }

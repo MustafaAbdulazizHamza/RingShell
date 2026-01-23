@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -29,7 +30,7 @@ func ReceiveAndSaveImage(conn net.Conn, savePath string, imgName string) error {
 		return fmt.Errorf("invalid image size: %w", err)
 	}
 
-	filePath := savePath + "/" + imgName
+	filePath := filepath.Join(savePath, imgName)
 	file, err := os.Create(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to create file %s: %w", filePath, err)

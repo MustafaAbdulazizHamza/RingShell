@@ -8,13 +8,21 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
+	"sync"
 )
 
 func bindPort(cmd []string) {
+	if len(cmd) < 4 {
+		log.Println("Invalid bind command format. Usage: bind <type> <port> named <name>")
+		return
+	}
+
 	port := cmd[1]
-	if !(len(cmd) == 4 && isAValidPortNumber(cmd[1])) {
+	if !isAValidPortNumber(cmd[1]) {
 		port = defaultPortNumber
 	}
+
 	switch cmd[0] {
 	case "listening":
 		setUpListeningServer(port, cmd[3])
@@ -23,92 +31,87 @@ func bindPort(cmd []string) {
 	default:
 		log.Println("Unknown server type.")
 	}
-
 }
 
 func setUpListeningServer(port string, name string) {
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", address, port))
 	if err != nil {
 		log.Println("Unable to bind to port", port, ".")
+		return
 	}
-	defer listener.Close()
-	i := 0
+
 	chann := make(chan string)
+	ctx, cancel := context.WithCancel(context.Background())
+
 	mu.Lock()
 	listeningServers[name] = port
 	listeningServersChannels[name] = chann
 	mu.Unlock()
-	outDir := fmt.Sprintf("%s/%s", outputDir, name)
+
+	outDir := filepath.Join(outputDir, name)
 	if !isExist(outDir) {
-		os.Mkdir(outDir, 0755)
+		os.MkdirAll(outDir, 0755)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+
+	connectionCounter := 0
+	var counterMu sync.Mutex
+
 	go func() {
+		defer listener.Close()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-
 			default:
 				conn, err := listener.Accept()
 				if ctx.Err() != nil {
 					return
 				}
 				if err != nil {
-					log.Println(err)
-					break
+					continue
 				}
-				go func() {
-					if err := listenerServiceHandler(ctx, conn, outDir, name, i); err != nil {
-						log.Println(err)
-						return
-
-					} else {
-						return
-					}
-				}()
-				i += 1
-
+				counterMu.Lock()
+				currentID := connectionCounter
+				connectionCounter++
+				counterMu.Unlock()
+				go listenerServiceHandler(ctx, conn, outDir, name, currentID)
 			}
 		}
 	}()
-	for {
-		message, _ := <-chann
-		if message == "exit" {
 
+	for {
+		message := <-chann
+		if message == "exit" {
+			cancel()
 			mu.Lock()
 			delete(listeningServersChannels, name)
 			delete(listeningServers, name)
 			mu.Unlock()
-			cancel()
 			break
 		}
 	}
 }
-func listenerServiceHandler(ctx context.Context, conn net.Conn, outDir string, outFile string, id int) (err error) {
+
+func listenerServiceHandler(ctx context.Context, conn net.Conn, outDir string, outFile string, id int) error {
 	defer conn.Close()
 
-	fi, err := os.OpenFile(fmt.Sprintf("%s/%s-%d.txt", outDir, outFile, id), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	fi, err := os.OpenFile(filepath.Join(outDir, fmt.Sprintf("%s-%d.txt", outFile, id)), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		return err
 	}
 	defer fi.Close()
-	done := make(chan error, 1)
 
+	done := make(chan error, 1)
 	go func() {
 		_, err := io.Copy(fi, conn)
-		if err != nil {
-			done <- err
-		}
-		done <- nil
+		done <- err
 	}()
 
 	select {
 	case <-ctx.Done():
 		return nil
-	case <-done:
+	case err := <-done:
 		return err
-
 	}
 }
 
@@ -116,35 +119,38 @@ func setUpControllerServer(port string, name string) {
 	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%s", address, port))
 	if err != nil {
 		log.Println("Unable to bind to port", port, ".")
+		return
 	}
-	defer listener.Close()
-	zompbiesChannels := make([]chan string, 0)
+
+	zombiesChannels := make([]chan string, 0)
+	var zombiesChannelsMu sync.Mutex
 	chann := make(chan string)
 	ctx, cancel := context.WithCancel(context.Background())
+
 	mu.Lock()
 	controllingServersChannels[name] = chann
 	controllingServers[name] = port
 	mu.Unlock()
+
 	go func() {
-		i := 0
+		defer listener.Close()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-
 			default:
 				conn, err := listener.Accept()
 				if ctx.Err() != nil {
 					return
 				}
 				if err != nil {
-					log.Println(err)
 					continue
 				}
-				zompbiesChannels = append(zompbiesChannels, make(chan string))
-				go zombiesHandler(conn, zompbiesChannels[i])
-				i += 1
-
+				zombiesCh := make(chan string, 10)
+				zombiesChannelsMu.Lock()
+				zombiesChannels = append(zombiesChannels, zombiesCh)
+				zombiesChannelsMu.Unlock()
+				go zombiesHandler(conn, zombiesCh)
 			}
 		}
 	}()
@@ -152,50 +158,45 @@ func setUpControllerServer(port string, name string) {
 	for {
 		message, open := <-chann
 		if !open {
-			log.Println(err)
 			break
 		}
-		for _, ch := range zompbiesChannels {
-			ch <- message
+
+		zombiesChannelsMu.Lock()
+		for _, ch := range zombiesChannels {
+			select {
+			case ch <- message:
+			default:
+			}
 		}
+		zombiesChannelsMu.Unlock()
+
 		if message == "exit" {
 			cancel()
-
 			break
 		}
-
 	}
+
 	mu.Lock()
 	delete(controllingServersChannels, name)
 	delete(controllingServers, name)
 	mu.Unlock()
-	cancel()
-
 }
+
 func zombiesHandler(conn net.Conn, chann chan string) {
-	defer func() {
-		if conn != nil {
-			conn.Close()
-		}
-	}()
+	defer conn.Close()
+	writer := bufio.NewWriter(conn)
+
 	for {
 		command, open := <-chann
-		if !open {
-			return
-		}
-		if command == "exit" {
-			return
-		}
-		writer := bufio.NewWriter(conn)
-		if _, err := writer.WriteString(command); err != nil {
-			log.Println(err)
+		if !open || command == "exit" {
 			return
 		}
 
+		if _, err := writer.WriteString(command + "\n"); err != nil {
+			return
+		}
 		if err := writer.Flush(); err != nil {
 			return
 		}
-
 	}
-
 }

